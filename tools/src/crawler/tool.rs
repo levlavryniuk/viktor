@@ -5,10 +5,8 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
+use tokio::{fs, task};
 
-/// Represents the "eyes" of the AI, providing file system
-/// observation capabilities. Always succeeds; failures
-/// become empty results.
 pub struct Crawler {
     root_path: PathBuf,
     matcher: SkimMatcherV2,
@@ -26,7 +24,7 @@ impl Crawler {
         }
     }
 
-    /// Fuzzy searches under `root_path`. On any walker error
+    /// Fuzzy searches under `root_path`. On any walker error,
     /// it just skips entries, so this always returns a Vec.
     pub fn fuzzy_search_paths(&self, queries: &[&str]) -> Vec<(i64, PathBuf)> {
         let mut best: HashMap<PathBuf, i64> = HashMap::new();
@@ -79,33 +77,56 @@ impl Crawler {
     /// Reads a file’s contents. Any failure => empty String.
     pub async fn read_file_contents<P: AsRef<Path>>(&self, rel: P) -> String {
         let full = self.root_path.join(rel.as_ref());
-        let canon = full.canonicalize().unwrap_or(full.clone());
+        let canon = full.clone().canonicalize().unwrap_or(full.clone());
         if !canon.starts_with(&self.root_path) || !full.is_file() {
             return String::new();
         }
-        tokio::fs::read_to_string(&full).await.unwrap_or_default()
+        fs::read_to_string(&full).await.unwrap_or_default()
     }
 
-    /// Lists direct children of a directory. Any failure => empty Vec.
-    pub async fn list_directory_contents<P: AsRef<Path>>(&self, rel: P) -> Vec<PathBuf> {
+    /// Lists children of `rel`, recursing up to `depth` levels.
+    pub async fn list_directory_contents<P: AsRef<Path>>(
+        &self,
+        rel: P,
+        depth: usize,
+    ) -> Vec<PathBuf> {
+        // 1) Resolve and check boundaries
         let full = self.root_path.join(rel.as_ref());
-        let canon = full.canonicalize().unwrap_or(full.clone());
+        let canon = full.clone().canonicalize().unwrap_or(full.clone());
         if !canon.starts_with(&self.root_path) || !full.is_dir() {
             return Vec::new();
         }
-        let mut out = Vec::new();
-        let mut rd = match tokio::fs::read_dir(&full).await {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            out.push(entry.path());
-        }
-        out
+
+        // 2) Spawn a blocking task for the WalkBuilder
+        let root = full.clone();
+        let max_depth = depth + 1; // 0 => only direct children
+        task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            let walker = WalkBuilder::new(&root)
+                .git_ignore(true)
+                .git_exclude(true)
+                .git_global(true)
+                .hidden(true)
+                .max_depth(Some(max_depth))
+                .build();
+
+            for res in walker.flatten() {
+                let entry = res;
+                let path = entry.path();
+                // skip the root itself
+                if path != root {
+                    out.push(path.to_path_buf());
+                }
+            }
+            dbg!(&out);
+            out
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Expose the (canonical) root path.
-    pub fn root_path(&self) -> &Path {
+    pub fn root_path(&self) -> &std::path::Path {
         &self.root_path
     }
 }
